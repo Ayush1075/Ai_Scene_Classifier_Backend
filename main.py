@@ -11,15 +11,13 @@ from pipeline import run_full_pipeline
 
 app = FastAPI(title="VisionSafe AI Navigation API", version="1.0.0")
 
-# ── CORS (allow your Vercel frontend + localhost dev) ──────────────────────────
+# ── CORS ───────────────────────────────────────────────────────────────────────
+# allow_origins=["*"] is fine for a portfolio/demo API.
+# If you later need credentials (cookies/auth), replace "*" with exact origins.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://*.vercel.app",
-        os.getenv("FRONTEND_URL", ""),   # set this in Render env vars
-    ],
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
