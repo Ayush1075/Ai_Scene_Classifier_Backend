@@ -25,6 +25,20 @@ OUTPUT_DIR = "/tmp/visionsafe_outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
+@app.on_event("startup")
+async def warmup():
+    """Load model into memory at startup — weights already cached on disk from build step."""
+    loop = asyncio.get_event_loop()
+    def _load():
+        from pipeline import get_model
+        get_model()
+    try:
+        await loop.run_in_executor(None, _load)
+        logger.info("Warmup complete — model ready in memory.")
+    except Exception as e:
+        logger.warning(f"Warmup skipped: {e}")
+
+
 @app.get("/")
 def root():
     return {"status": "VisionSafe API is running", "version": "1.0.0"}
@@ -42,8 +56,8 @@ async def analyze_image(file: UploadFile = File(...)):
 
     suffix = os.path.splitext(file.filename or "upload.jpg")[-1] or ".jpg"
     job_id = str(uuid.uuid4())[:8]
-    tmp_input    = os.path.join(OUTPUT_DIR, f"input_{job_id}{suffix}")
-    tmp_img_out  = os.path.join(OUTPUT_DIR, f"annotated_{job_id}.jpg")
+    tmp_input     = os.path.join(OUTPUT_DIR, f"input_{job_id}{suffix}")
+    tmp_img_out   = os.path.join(OUTPUT_DIR, f"annotated_{job_id}.jpg")
     tmp_audio_out = os.path.join(OUTPUT_DIR, f"narration_{job_id}.mp3")
 
     try:
@@ -52,19 +66,15 @@ async def analyze_image(file: UploadFile = File(...)):
         with open(tmp_input, "wb") as f:
             f.write(contents)
 
-        # Import here (not at module level) so startup never loads torch
         from pipeline import run_full_pipeline
 
         logger.info(f"[{job_id}] Starting pipeline...")
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
-            None,
-            run_full_pipeline,
-            tmp_input,
-            tmp_img_out,
-            tmp_audio_out,
+            None, run_full_pipeline,
+            tmp_input, tmp_img_out, tmp_audio_out,
         )
-        logger.info(f"[{job_id}] Pipeline complete: {result['label']} / {result['direction']}")
+        logger.info(f"[{job_id}] Done: {result['label']} / {result['direction']}")
 
         return JSONResponse({
             "job_id": job_id,
@@ -78,12 +88,16 @@ async def analyze_image(file: UploadFile = File(...)):
             "audio_url": f"/output/audio/{job_id}",
         })
 
+    except TimeoutError:
+        logger.warning(f"[{job_id}] Model load timed out")
+        raise HTTPException(status_code=503, detail="Model is still loading. Please retry in a moment.")
+
     except MemoryError:
         logger.error(f"[{job_id}] OUT OF MEMORY")
-        raise HTTPException(status_code=503, detail="Out of memory — image too large or model too heavy for free tier")
+        raise HTTPException(status_code=503, detail="Out of memory — try a smaller image")
 
     except Exception as e:
-        logger.error(f"[{job_id}] Pipeline error:\n{traceback.format_exc()}")
+        logger.error(f"[{job_id}] Error:\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
 
     finally:

@@ -11,36 +11,80 @@ Memory budget: ~450 MB total
 
 import os
 import gc
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+
 import cv2
 import numpy as np
 import logging
 
 logger = logging.getLogger("visionsafe")
 
-# ── Lazy model singleton ──────────────────────────────────────────────────────
-_model      = None
+TORCH_CACHE_DIR = os.path.expanduser("~/.cache/torch")
+os.environ.setdefault("TORCH_HOME", TORCH_CACHE_DIR)
+
+_model = None
 _preprocess = None
+_model_future = None
+_model_future_lock = threading.Lock()
+_model_loader_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="visionsafe-model-loader")
 
 
-def get_model():
-    global _model, _preprocess
-    if _model is not None:
-        return _model, _preprocess
-
+def _load_model_assets():
     import torch
     from torchvision import models, transforms
 
-    logger.info("Loading DeepLabV3-MobileNetV3 (CPU)...")
-    _model = models.segmentation.deeplabv3_mobilenet_v3_large(
+    t0 = time.monotonic()
+    logger.info("Loading DeepLabV3-MobileNetV3 from torch cache at %s...", os.environ.get("TORCH_HOME"))
+
+    model = models.segmentation.deeplabv3_mobilenet_v3_large(
         weights="DEFAULT"
     ).cpu().eval()
 
-    _preprocess = transforms.Compose([
+    preprocess = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406],
                              std=[0.229, 0.224, 0.225]),
     ])
-    logger.info("Model ready.")
+
+    logger.info("Model ready in %.1fs", time.monotonic() - t0)
+    return model, preprocess
+
+
+def get_model(timeout_seconds: float | None = None):
+    global _model, _preprocess, _model_future
+
+    if _model is not None:
+        return _model, _preprocess
+
+    with _model_future_lock:
+        if _model is not None:
+            return _model, _preprocess
+
+        if _model_future is None:
+            _model_future = _model_loader_executor.submit(_load_model_assets)
+
+        future = _model_future
+
+    try:
+        model, preprocess = future.result(timeout=timeout_seconds)
+    except FuturesTimeoutError as exc:
+        timeout_label = timeout_seconds if timeout_seconds is not None else "unbounded"
+        logger.warning("Timed out waiting for model load after %ss", timeout_label)
+        raise TimeoutError(f"Timed out waiting for model load after {timeout_label}s") from exc
+    except Exception:
+        with _model_future_lock:
+            if _model_future is future:
+                _model_future = None
+        raise
+
+    with _model_future_lock:
+        _model = model
+        _preprocess = preprocess
+        if _model_future is future:
+            _model_future = None
+
     return _model, _preprocess
 
 
@@ -163,10 +207,15 @@ def draw_overlay(img_rgb, label, direction, dist, conf):
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
-def run_full_pipeline(input_path: str, output_img: str, output_audio: str) -> dict:
+def run_full_pipeline(
+    input_path: str,
+    output_img: str,
+    output_audio: str,
+    model_timeout_seconds: float | None = 25.0,
+) -> dict:
     import torch
 
-    model, preprocess = get_model()
+    model, preprocess = get_model(timeout_seconds=model_timeout_seconds)
 
     # Read + resize to 480px wide (saves ~40% RAM vs 640)
     bgr = cv2.imread(input_path)

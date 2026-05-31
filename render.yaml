@@ -3,9 +3,9 @@ services:
     name: visionsafe-api
     runtime: python
     pythonVersion: "3.11.9"
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    buildCommand: pip install -r requirements.txt && python download_model.py
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --timeout-keep-alive 120
     envVars:
       - key: FRONTEND_URL
-        value: https://your-app.vercel.app   # update after Vercel deploy
+        value: https://ai-scene-classifier-frontend-esxe.vercel.app
     autoDeploy: true
