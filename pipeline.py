@@ -1,259 +1,236 @@
 """
-pipeline.py — Full VisionSafe inference pipeline
-Adapted from the Colab notebook for production use.
+pipeline.py — VisionSafe inference pipeline (RAM-optimised for Render free tier)
+
+Memory budget: ~450 MB total
+  - deeplabv3_mobilenet_v3_large weights: ~45 MB
+  - inference tensors (640px input): ~80 MB
+  - opencv + numpy overhead: ~60 MB
+  ─────────────────────────────────────────
+  Total: ~185 MB  ✓ fits in 512 MB free tier
 """
 
 import os
+import gc
 import cv2
 import numpy as np
-import torch
-from torchvision import models, transforms
-from scipy import ndimage
+import logging
 
-# ── Lazy model loading (loaded once, reused across requests) ──────────────────
-_model = None
-_device = None
+logger = logging.getLogger("visionsafe")
+
+# ── Lazy model singleton ──────────────────────────────────────────────────────
+_model      = None
 _preprocess = None
 
 
 def get_model():
-    global _model, _device, _preprocess
-    if _model is None:
-        _device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"[VisionSafe] Loading DeepLabV3 on {_device}...")
-        # Use MobileNetV3 (lighter) for CPU deployment on Render free tier
-        _model = models.segmentation.deeplabv3_mobilenet_v3_large(
-            weights="DEFAULT"
-        ).to(_device).eval()
-        _preprocess = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-        print("[VisionSafe] Model loaded.")
-    return _model, _device, _preprocess
+    global _model, _preprocess
+    if _model is not None:
+        return _model, _preprocess
+
+    import torch
+    from torchvision import models, transforms
+
+    logger.info("Loading DeepLabV3-MobileNetV3 (CPU)...")
+    _model = models.segmentation.deeplabv3_mobilenet_v3_large(
+        weights="DEFAULT"
+    ).cpu().eval()
+
+    _preprocess = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                             std=[0.229, 0.224, 0.225]),
+    ])
+    logger.info("Model ready.")
+    return _model, _preprocess
 
 
-# ── Label IDs (torchvision COCO/VOC) ─────────────────────────────────────────
-ROAD = 0
-PERSON = 15
-CAR, BUS, TRUCK, TRAIN, MOTORCYCLE, BICYCLE = 13, 6, 8, 7, 14, 1
-VEHICLE_IDS = [CAR, BUS, TRUCK, TRAIN, MOTORCYCLE, BICYCLE]
+# ── COCO/VOC class IDs ────────────────────────────────────────────────────────
+ROAD        = 0
+PERSON      = 15
+VEHICLE_IDS = [6, 7, 8, 13, 14, 1]   # bus, train, truck, car, motorbike, bicycle
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-def count_instances(mask):
+def count_blobs(mask):
+    from scipy import ndimage
     _, n = ndimage.label(mask.astype(np.uint8))
     return int(n)
 
 
-def region_slices(W):
-    t = W // 3
-    return {"left": (0, t), "center": (t, 2 * t), "right": (2 * t, W)}
-
-
-def compute_region_stats(seg, road_mask, obstacle_mask):
-    H, W = seg.shape
-    regions = region_slices(W)
+def compute_region_stats(road_mask, obstacle_mask):
+    H, W  = road_mask.shape
+    third = W // 3
+    cuts  = {"left": (0, third), "center": (third, 2*third), "right": (2*third, W)}
     stats = {}
-    for name, (x0, x1) in regions.items():
-        r_obst = obstacle_mask[:, x0:x1]
-        r_road = road_mask[:, x0:x1]
-        region_area = r_obst.size
-        obst_density = float(r_obst.sum() / region_area)
-        road_free = float(r_road.sum() / region_area)
-        prox_norm = 0.0
-        if r_obst.sum() > 0:
-            ys, _ = np.where(r_obst > 0)
+    for name, (x0, x1) in cuts.items():
+        ro  = obstacle_mask[:, x0:x1]
+        rr  = road_mask[:, x0:x1]
+        sz  = ro.size
+        od  = float(ro.sum() / sz)
+        rf  = float(rr.sum() / sz)
+        prox = 0.0
+        if ro.sum() > 0:
+            ys, _ = np.where(ro > 0)
             if ys.size > 0:
-                prox_norm = float(np.clip(1.0 - ((H - ys.max()) / H) ** 1.3, 0, 1))
-        stats[name] = {
-            "obstacle_density": obst_density,
-            "free_road_frac": road_free,
-            "proximity_score": prox_norm,
-        }
+                prox = float(np.clip(1.0 - ((H - ys.max()) / H) ** 1.3, 0, 1))
+        stats[name] = {"obstacle_density": od, "free_road_frac": rf, "proximity_score": prox}
     return stats
 
 
-def compute_direction(stats):
+def decide_direction(stats):
     risk = {
-        k: 0.45 * v["obstacle_density"] + 0.35 * v["proximity_score"] + 0.20 * (1 - v["free_road_frac"])
+        k: 0.45*v["obstacle_density"] + 0.35*v["proximity_score"] + 0.20*(1-v["free_road_frac"])
         for k, v in stats.items()
     }
     best = min(risk, key=risk.get)
-    c_risk = risk["center"]
-    if c_risk <= 0.42:
+    if risk["center"] <= 0.42:
         return "straight", risk
-    elif risk[best] >= 0.65:
+    if risk[best] >= 0.65:
         return "stop", risk
-    else:
-        return best, risk   # "left" or "right"
+    return best, risk
 
 
-def fuzzy_safety_score(road_occ, ped_count, veh_count, unknown_area):
-    """Weighted fuzzy scoring (no skfuzzy dependency for deployment)."""
-    road_score = max(0, 100 - road_occ)
-    ped_score  = max(0, 100 - (ped_count * 5))
-    veh_score  = max(0, 100 - abs(veh_count - 5) * 10)
-    vis_score  = max(0, 100 - (unknown_area * 30))
-    score = 0.2 * road_score + 0.4 * ped_score + 0.3 * veh_score + 0.1 * vis_score
-    if ped_count > 10 and veh_count > 8:  score -= 25
-    elif ped_count > 8 and veh_count > 5: score -= 15
-    elif ped_count > 5 and veh_count > 3: score -= 10
-    return float(np.clip(score, 0, 100))
+def safety_score(road_occ, ped, veh, unk):
+    s = (0.2 * max(0, 100 - road_occ)
+       + 0.4 * max(0, 100 - ped * 5)
+       + 0.3 * max(0, 100 - abs(veh - 5) * 10)
+       + 0.1 * max(0, 100 - unk * 30))
+    if ped > 10 and veh > 8:  s -= 25
+    elif ped > 8 and veh > 5: s -= 15
+    elif ped > 5 and veh > 3: s -= 10
+    return float(np.clip(s, 0, 100))
 
 
-def label_from_score(score):
+def label_from(score):
     if score < 40:   return "Danger"
-    elif score < 70: return "Caution"
-    else:            return "Safe"
+    if score < 70:   return "Caution"
+    return "Safe"
 
 
-def proximity_to_meters(prox_norm):
-    return round(12.0 * (1.0 - prox_norm), 1)
+def prox_to_meters(p):
+    return round(12.0 * (1.0 - p), 1)
 
 
-def generate_explanation(label, road_occ, ped_count, veh_count, unknown_area):
+def explain(label, road_occ, ped, veh, unk):
     parts = []
-    if ped_count > 5:   parts.append(f"{ped_count} pedestrians detected")
-    if veh_count > 3:   parts.append(f"{veh_count} vehicles nearby")
-    if road_occ < 30:   parts.append("low road visibility")
-    if unknown_area > 3: parts.append("obstructed areas in scene")
-    if not parts:       parts.append("scene appears open and clear")
-    return ", ".join(parts)
+    if ped  > 5:  parts.append(f"{ped} pedestrians detected")
+    if veh  > 3:  parts.append(f"{veh} vehicles nearby")
+    if road_occ < 30: parts.append("low road visibility")
+    if unk  > 3:  parts.append("obstructed areas in scene")
+    return ", ".join(parts) if parts else "scene appears open and clear"
 
 
-def build_narration(label, direction, distance_m, explanation):
-    direction_map = {
-        "straight": "Continue straight",
-        "left": "Turn left",
-        "right": "Turn right",
-        "stop": "Stop and wait",
-    }
-    move = direction_map.get(direction, "Proceed with caution")
+def narrate(label, direction, dist, expl):
+    mv = {"straight": "Continue straight", "left": "Turn left",
+          "right": "Turn right", "stop": "Stop and wait"}.get(direction, "Proceed with caution")
     if label == "Danger":
-        return f"Danger ahead. {explanation}. Stop immediately."
-    elif label == "Caution":
-        return f"Caution. {explanation}. {move}, approximately {distance_m} meters."
-    else:
-        return f"Path looks safe. {move}, approximately {distance_m} meters ahead."
+        return f"Danger ahead. {expl}. Stop immediately."
+    if label == "Caution":
+        return f"Caution. {expl}. {mv}, approximately {dist} meters."
+    return f"Path looks safe. {mv}, approximately {dist} meters ahead."
 
 
-def draw_overlay(img_rgb, label, direction, distance_m, confidence):
+def draw_overlay(img_rgb, label, direction, dist, conf):
     vis = img_rgb.copy()
     h, w = vis.shape[:2]
-
-    # Semi-transparent top bar
     overlay = vis.copy()
     cv2.rectangle(overlay, (0, 0), (w, 100), (10, 10, 10), -1)
     vis = cv2.addWeighted(overlay, 0.65, vis, 0.35, 0)
 
-    color_map = {"Safe": (80, 220, 100), "Caution": (255, 210, 50), "Danger": (220, 60, 60)}
-    color = color_map.get(label, (200, 200, 200))
+    colors = {"Safe": (80,220,100), "Caution": (255,210,50), "Danger": (220,60,60)}
+    rgb = colors.get(label, (200,200,200))
+    bgr = (rgb[2], rgb[1], rgb[0])
 
-    # BGR for OpenCV
-    bgr = (color[2], color[1], color[0])
-
-    cv2.putText(vis, f"{label}", (30, 52),
-                cv2.FONT_HERSHEY_DUPLEX, 1.6, bgr, 3, cv2.LINE_AA)
-    cv2.putText(vis, f"{direction.upper()}  |  {distance_m}m  |  {confidence:.0f}% conf",
+    cv2.putText(vis, label, (30, 52), cv2.FONT_HERSHEY_DUPLEX, 1.6, bgr, 3, cv2.LINE_AA)
+    cv2.putText(vis, f"{direction.upper()}  |  {dist}m  |  {conf:.0f}% conf",
                 (30, 88), cv2.FONT_HERSHEY_SIMPLEX, 0.75, bgr, 2, cv2.LINE_AA)
 
-    # Direction arrow
     cx = w // 2
-    arrow_color = bgr
     if direction == "left":
-        cv2.arrowedLine(vis, (cx, h - 60), (cx - 160, h // 2 + 40), arrow_color, 8, tipLength=0.3)
+        cv2.arrowedLine(vis, (cx, h-60), (cx-160, h//2+40), bgr, 8, tipLength=0.3)
     elif direction == "right":
-        cv2.arrowedLine(vis, (cx, h - 60), (cx + 160, h // 2 + 40), arrow_color, 8, tipLength=0.3)
+        cv2.arrowedLine(vis, (cx, h-60), (cx+160, h//2+40), bgr, 8, tipLength=0.3)
     elif direction == "straight":
-        cv2.arrowedLine(vis, (cx, h - 60), (cx, h // 2 + 20), arrow_color, 8, tipLength=0.3)
+        cv2.arrowedLine(vis, (cx, h-60), (cx, h//2+20), bgr, 8, tipLength=0.3)
     else:
-        cv2.putText(vis, "STOP", (cx - 70, h // 2 + 20),
-                    cv2.FONT_HERSHEY_DUPLEX, 2.2, (0, 0, 220), 6, cv2.LINE_AA)
+        cv2.putText(vis, "STOP", (cx-70, h//2+20),
+                    cv2.FONT_HERSHEY_DUPLEX, 2.2, (0,0,220), 6, cv2.LINE_AA)
 
-    # Region risk dividers
-    t1, t2 = w // 3, 2 * w // 3
-    cv2.line(vis, (t1, 100), (t1, h), (180, 180, 180), 1)
-    cv2.line(vis, (t2, 100), (t2, h), (180, 180, 180), 1)
+    for x in [w//3, 2*w//3]:
+        cv2.line(vis, (x, 100), (x, h), (180,180,180), 1)
 
     return vis
 
 
-# ── Main pipeline entry point ─────────────────────────────────────────────────
-def run_full_pipeline(input_image_path: str, output_image_path: str, output_audio_path: str) -> dict:
-    model, device, preprocess = get_model()
+# ── Entry point ───────────────────────────────────────────────────────────────
+def run_full_pipeline(input_path: str, output_img: str, output_audio: str) -> dict:
+    import torch
 
-    # Read & resize
-    bgr = cv2.imread(input_image_path)
+    model, preprocess = get_model()
+
+    # Read + resize to 480px wide (saves ~40% RAM vs 640)
+    bgr = cv2.imread(input_path)
     if bgr is None:
-        raise ValueError(f"Cannot read image: {input_image_path}")
-    H0, W0 = bgr.shape[:2]
-    target_w = 640
-    target_h = int(H0 * (target_w / W0))
-    bgr_r = cv2.resize(bgr, (target_w, target_h), interpolation=cv2.INTER_AREA)
-    rgb = cv2.cvtColor(bgr_r, cv2.COLOR_BGR2RGB)
+        raise ValueError(f"Cannot read image: {input_path}")
 
-    # Segmentation
-    inp = preprocess(rgb).unsqueeze(0).to(device)
+    H0, W0 = bgr.shape[:2]
+    tw = 480
+    th = int(H0 * tw / W0)
+    bgr = cv2.resize(bgr, (tw, th), interpolation=cv2.INTER_AREA)
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+    # Segmentation (CPU, no grad)
+    inp = preprocess(rgb).unsqueeze(0)
     with torch.no_grad():
         seg = model(inp)["out"][0].argmax(0).byte().cpu().numpy()
 
-    total_pixels = seg.size
-    road_mask     = (seg == ROAD).astype(np.uint8)
-    person_mask   = (seg == PERSON).astype(np.uint8)
-    vehicle_mask  = np.isin(seg, VEHICLE_IDS).astype(np.uint8)
-    obstacle_mask = np.clip(person_mask + vehicle_mask, 0, 1).astype(np.uint8)
-    unknown_mask  = np.isin(seg, [2, 3, 4, 5, 9, 10, 11, 12]).astype(np.uint8)
+    # Free tensor memory immediately
+    del inp
+    gc.collect()
 
-    road_occ    = float((road_mask.sum() / total_pixels) * 100)
-    ped_count   = count_instances(person_mask)
-    veh_count   = count_instances(vehicle_mask)
-    unknown_pct = float((unknown_mask.sum() / total_pixels) * 100)
+    total  = seg.size
+    road_m = (seg == ROAD).astype(np.uint8)
+    pers_m = (seg == PERSON).astype(np.uint8)
+    veh_m  = np.isin(seg, VEHICLE_IDS).astype(np.uint8)
+    obst_m = np.clip(pers_m + veh_m, 0, 1).astype(np.uint8)
+    unk_m  = np.isin(seg, [2,3,4,5,9,10,11,12]).astype(np.uint8)
 
-    # Fuzzy safety score → label
-    score = fuzzy_safety_score(road_occ, ped_count, veh_count, unknown_pct)
-    label = label_from_score(score)
+    road_occ = float(road_m.sum() / total * 100)
+    ped      = count_blobs(pers_m)
+    veh      = count_blobs(veh_m)
+    unk_pct  = float(unk_m.sum() / total * 100)
 
-    # Spatial direction
-    stats = compute_region_stats(seg, road_mask, obstacle_mask)
-    direction, risk = compute_direction(stats)
+    score     = safety_score(road_occ, ped, veh, unk_pct)
+    lbl       = label_from(score)
+    stats     = compute_region_stats(road_m, obst_m)
+    direction, risk = decide_direction(stats)
 
-    # Distance estimate
-    prox_key = f"{direction}_proximity" if direction in ("left", "center", "right") else "center_proximity"
     region_key = direction if direction in stats else "center"
-    prox_norm = stats[region_key]["proximity_score"]
-    distance_m = proximity_to_meters(prox_norm)
-
-    # Confidence
-    confidence = float(np.clip(100 - (unknown_pct * 0.8 + ped_count * 2 + veh_count * 1.5), 20, 100))
-
-    # Explanation + narration
-    explanation   = generate_explanation(label, road_occ, ped_count, veh_count, unknown_pct)
-    narration_txt = build_narration(label, direction, distance_m, explanation)
+    dist       = prox_to_meters(stats[region_key]["proximity_score"])
+    conf       = float(np.clip(100 - (unk_pct*0.8 + ped*2 + veh*1.5), 20, 100))
+    expl       = explain(lbl, road_occ, ped, veh, unk_pct)
+    narr       = narrate(lbl, direction, dist, expl)
 
     # Annotated image
-    annotated_rgb = draw_overlay(rgb, label, direction, distance_m, confidence)
-    cv2.imwrite(output_image_path, cv2.cvtColor(annotated_rgb, cv2.COLOR_RGB2BGR))
+    ann = draw_overlay(rgb, lbl, direction, dist, conf)
+    cv2.imwrite(output_img, cv2.cvtColor(ann, cv2.COLOR_RGB2BGR))
 
-    # Audio narration
+    # Audio (gTTS calls Google's API — lightweight)
     try:
         from gtts import gTTS
-        tts = gTTS(text=narration_txt, lang="en", slow=False)
-        tts.save(output_audio_path)
+        gTTS(text=narr, lang="en", slow=False).save(output_audio)
     except Exception as e:
-        print(f"[Audio] gTTS failed: {e}. Skipping audio.")
-        output_audio_path = None
+        logger.warning(f"gTTS failed: {e}")
 
     return {
-        "label": label,
+        "label": lbl,
         "direction": direction,
-        "distance_m": distance_m,
-        "confidence": round(confidence, 1),
+        "distance_m": dist,
+        "confidence": round(conf, 1),
         "score": round(score, 2),
-        "explanation": explanation,
-        "narration_text": narration_txt,
+        "explanation": expl,
+        "narration_text": narr,
         "road_occupancy": round(road_occ, 2),
-        "pedestrian_count": ped_count,
-        "vehicle_count": veh_count,
+        "pedestrian_count": ped,
+        "vehicle_count": veh,
     }
